@@ -1,7 +1,12 @@
 # ---------- IMPORTANT: Fix macOS + Python 3.13 mouse events ----------
 import matplotlib
-matplotlib.use("TkAgg")  # <-- REQUIRED FIX for mouse clicks on macOS/Py3.13
+matplotlib.use("TkAgg")  # REQUIRED FIX for mouse clicks on macOS/Py3.13
 # --------------------------------------------------------------------
+
+import os
+import json
+from pathlib import Path
+from dataclasses import dataclass, asdict, field
 
 import numpy as np
 import pandas as pd
@@ -17,9 +22,65 @@ INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
 
-LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
-RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
+LINE_TOLERANCE_PCT = 0.0001   # tolerance for deleting a nearby level (fraction of last price)
+RSI_CLICK_TOL = 5.0           # +/- RSI points tolerance to accept RSI-curve click
 
+APP_NAME = "rsi_price6"
+
+
+# ===================== State (JSON) =====================
+
+def default_state_path() -> Path:
+    # macOS/Linux: ~/.config/<app>/state.json ; Windows: %APPDATA%\<app>\state.json
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / APP_NAME / "state.json"
+
+
+@dataclass
+class AppState:
+    symbol: str = DEFAULT_SYMBOL
+    period: str = PERIOD
+    interval: str = INTERVAL
+    price_lines: list[float] = field(default_factory=list)
+
+
+def load_state() -> AppState:
+    path = default_state_path()
+    if not path.exists():
+        return AppState()
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return AppState()
+
+    st = AppState()
+    for k, v in raw.items():
+        if hasattr(st, k):
+            setattr(st, k, v)
+
+    if not isinstance(st.price_lines, list):
+        st.price_lines = []
+    return st
+
+
+def save_state(state: AppState) -> None:
+    path = default_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(asdict(state), f, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+
+    tmp.replace(path)
+
+
+# ===================== Indicators =====================
 
 def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
@@ -31,21 +92,30 @@ def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+# ===================== App =====================
+
 class TickerWithRSIPlot:
     """
-    Flat-to-flat model with alternating direction:
-
-      Trade 1: BUY -> SELL (long)
-      Trade 2: SELL -> BUY (short)
-      Trade 3: BUY -> SELL (long)
+    Flat-to-flat alternating model:
+      Trade 1: BUY→SELL (long)
+      Trade 2: SELL→BUY (short)
+      Trade 3: BUY→SELL (long)
       ...
 
-    Each click adds a level (or deletes if within tolerance).
-    PnL is computed from completed entry/exit pairs.
-    If there's an open trade (odd number of levels), we compute unrealized PnL.
+    Click on price chart:
+      - Adds a horizontal level
+      - If click is near an existing level (within tolerance), deletes it
+
+    Click on RSI chart (near the RSI curve):
+      - Adds/deletes a level at that candle's Close (same toggle behavior)
+
+    Key:
+      - 'r' resets all levels (and state)
     """
-    def __init__(self, symbol: str):
+
+    def __init__(self, symbol: str, state: AppState):
         self.symbol = symbol
+        self.state = state
 
         self.fig, (self.ax_price, self.ax_rsi) = plt.subplots(
             2, 1, sharex=True,
@@ -54,101 +124,62 @@ class TickerWithRSIPlot:
         )
         self.fig.subplots_adjust(hspace=0.05)
 
-        self.price_line = None
-        self.rsi_line = None
-        self.df = None
+        self.df: pd.DataFrame | None = None
 
-        # Clicked price levels (in order)
-        self.levels: list[float] = []
+        # Restore saved levels
+        self.levels: list[float] = list(self.state.price_lines)
         self.level_artists = []
 
+        # Event hooks
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
 
+        # Initial draw + timer refresh
         self.update_data_and_redraw()
-
         timer = self.fig.canvas.new_timer(interval=REFRESH_MS)
         timer.add_callback(self.update_data_and_redraw)
         timer.start()
 
     # ---------- Data ----------
-    def fetch_data(self):
+    def fetch_data(self) -> pd.DataFrame:
         df = yf.download(
             self.symbol,
-            period=PERIOD,
-            interval=INTERVAL,
+            period=self.state.period,
+            interval=self.state.interval,
             progress=False,
+            auto_adjust=False,  # avoids yfinance warning + keeps consistent Close
         )
-        #print(df)
-        if df.empty:
-            print(f"No data for {self.symbol}")
-            return df
+        if df is None or df.empty:
+            return pd.DataFrame()
 
         df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
         return df.dropna()
 
-    def get_last_price(self):
-        if self.price_line is None:
+    def last_price(self) -> float | None:
+        if self.df is None or self.df.empty:
             return None
-        y = np.asarray(self.price_line.get_ydata())
-        if len(y) == 0:
-            return None
-        return float(y[-1])
+        return float(self.df["Close"].iloc[-1])
 
-    # ---------- Alternating flat direction ----------
-    def side_for_level_index(self, i: int) -> str:
-        #print("side dor level index")
-        """
-        i = 0-based index into self.levels
-        Even-indexed levels are ENTRIES, odd-indexed are EXITS.
-
-        Direction alternates per trade:
-          trade_idx = i // 2
-          trade 0 entry = BUY (long)
-          trade 1 entry = SELL (short)
-          trade 2 entry = BUY (long)
-          ...
-
-        Entry side:
-          BUY if trade_idx even else SELL
-        Exit side is opposite of entry.
-        """
-        trade_idx = i // 2
-        is_entry = (i % 2 == 0)
-        #print("trade_idx:", trade_idx)
-        entry_side = "SELL" if (trade_idx % 2 == 0) else "BUY"
-        if is_entry:
-            return entry_side
-        return "SELL" if entry_side == "SELL" else "BUY"
-
+    # ---------- Trading model ----------
     def simulate(self, last_price: float):
-        """
-        Computes:
-          realized, unrealized, total, status_string
-
-        Realized from completed pairs (entry, exit).
-        Unrealized from open trade if odd number of levels.
-        """
         realized = 0.0
         unrealized = 0.0
         status = "Risk Off"
 
         n = len(self.levels)
-    
         pairs = n // 2
 
-        # Realized for each completed trade
+        # Completed trades
         for t in range(pairs):
             entry = self.levels[2*t]
             exit_ = self.levels[2*t + 1]
-
-            entry_side = "BUY" if (t % 2 == 0) else "SELL"
-
+            entry_side = "BUY" if (t % 2 == 0) else "SELL"  # Trade 1 long, Trade 2 short, ...
             if entry_side == "BUY":
-                realized += (exit_ - entry)      # long
+                realized += (exit_ - entry)
             else:
-                realized += (entry - exit_)      # short
+                realized += (entry - exit_)
 
-        # Open trade?
+        # Open trade (odd number of levels)
         if n % 2 == 1:
             t = n // 2
             entry = self.levels[-1]
@@ -157,14 +188,34 @@ class TickerWithRSIPlot:
                 unrealized = (last_price - entry)
                 status = f"OPEN LONG @ {entry:.3f}"
             else:
-                unrealized = (entry - last_price) 
+                unrealized = (entry - last_price)
                 status = f"OPEN SHORT @ {entry:.3f}"
-            print("unrealized:", unrealized)    
 
-        total = (realized + unrealized)
+        total = realized + unrealized
         return realized, unrealized, total, status
 
     # ---------- Drawing ----------
+    def color_from_trade_count(self, count: int) -> str:
+        # Keeps your vibe: black baseline + green/red for alternating legs
+        cycle = ["black", "green", "black", "red"]
+        return cycle[count % 4]
+
+    def redraw_levels(self):
+        # Remove old artists
+        for a in self.level_artists:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self.level_artists = []
+
+        count = 0
+        for lvl in self.levels:
+            count += 1
+            color = self.color_from_trade_count(count)
+            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color)
+            self.level_artists.append(line)
+
     def update_data_and_redraw(self):
         df = self.fetch_data()
         if df.empty:
@@ -175,49 +226,41 @@ class TickerWithRSIPlot:
         p = df["Close"]
         r = df["RSI"]
 
-        if self.price_line is None:
-            self.price_line, = self.ax_price.plot(x, p, lw=.5, color = "blue")
-        else:
-            self.price_line.set_data(x, p)
-        if self.rsi_line is None:
-            self.rsi_line, = self.ax_rsi.plot(x, r, lw=.25)
-        else:
-            self.rsi_line.set_data(x, r)
+        last = float(p.iloc[-1])
+        realized, unrealized, total, status = self.simulate(last)
 
-        last_price = float(p.iloc[-1])
-        self.rsi_line, = self.ax_rsi.plot(x, r, lw=.25, color="black")
-        realized, unrealized, total, status = self.simulate(last_price)
+        # Clear axes each refresh (simple + avoids stacking artifacts)
+        self.ax_price.clear()
+        self.ax_rsi.clear()
 
- #       self.ax_price.set_title("Main Title", fontsize=14, pad=20)
+        # Plot
+        self.ax_price.plot(x, p, lw=0.5, color="blue")
+        self.ax_rsi.plot(x, r, lw=0.25, color="black")
 
-        self.ax_price.text(
-            0.5, 1.09,
-            "Click To Trade Using RSI",
-            transform=self.ax_price.transAxes,
-            ha="center",
-            va="bottom",
-            fontsize = 16,
-            color="black"
-        )
-        self.ax_price.set_title(
-            f"{self.symbol}  "
-            f"{last_price:,.3f}  "
-            f"Interval:{INTERVAL}  "
-            f"Realized:{realized:,.3f}  "
-            f"Unrealized:{unrealized:,.3f}  "
-            f"Total:{total:,.3f}  "
-            f"{status}",
-            color="black",
-            fontsize = 15
-
-        )        
-        self.ax_price.set_ylabel("Price")
-        
+        # Styling
         self.ax_price.set_facecolor("lightgray")
         self.ax_rsi.set_facecolor("cyan")
 
-        self.ax_price.relim()
-        self.ax_price.autoscale_view()
+        self.ax_price.text(
+            0.5, 1.09,
+            "Click To Trade Using RSI   (press 'r' to reset)",
+            transform=self.ax_price.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=16,
+            color="black"
+        )
+
+        self.ax_price.set_title(
+            f"{self.symbol}  {last:,.3f}  "
+            f"Interval:{self.state.interval}  "
+            f"Realized:{realized:,.3f}  "
+            f"Unrealized:{unrealized:,.3f}  "
+            f"Total:{total:,.3f}  {status}",
+            color="black",
+            fontsize=15
+        )
+        self.ax_price.set_ylabel("Price")
 
         self.ax_rsi.set_ylabel("RSI")
         self.ax_rsi.set_ylim(0, 100)
@@ -226,64 +269,42 @@ class TickerWithRSIPlot:
 
         self.ax_rsi.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         self.fig.autofmt_xdate()
-        #print(type(self.ax_price))
-        #print(dir(self.ax_price))
+
+        # Levels
         self.redraw_levels()
         self.fig.canvas.draw_idle()
-    def color_from_trade_count(self, trade_count: int) -> str:
-        #cycle = ["green", "black", "red", "black"]
-        cycle = ["black", "green", "black", "red"]
 
-        return cycle[trade_count % 4]
-    def redraw_levels(self):
-        for a in self.level_artists:
-            a.remove()
-        self.level_artists = []
-        count = 0   
-        # Draw lines; (keeping style simple—semantics are in title & PnL)
-        #Direction alternates per trade:
-        #trade_idx = i // 2
-        #trade 0 entry = BUY (long)
-        #trade 1 entry = SELL (short)
-        #trade 2 entry = BUY (long)
-        for lvl in self.levels:
-            count = count + 1
-            color = self.color_from_trade_count(count)
+    # ---------- Level toggle / persistence ----------
+    def sync_state(self):
+        self.state.price_lines = list(self.levels)
 
-            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color)
-            self.level_artists.append(line)
-
-    # ---------- Toggle line ----------
     def toggle_level(self, price_value: float):
-        last_price = self.get_last_price()
-        if last_price is None:
+        last = self.last_price()
+        if last is None:
             return
-        #print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!last_price:", last_price)
-        tol = last_price * LINE_TOLERANCE_PCT
+
+        tol = last * LINE_TOLERANCE_PCT
 
         # Find nearest existing level within tolerance
         nearest_idx = None
         nearest_delta = None
         for i, lvl in enumerate(self.levels):
             d = abs(lvl - price_value)
-            #print("d:",d)
             if d <= tol and (nearest_delta is None or d < nearest_delta):
                 nearest_delta = d
                 nearest_idx = i
 
-        # Delete if near
-        #if nearest_idx is not None:
-            #del self.levels[nearest_idx]
-            #self.redraw_levels()
-            #self.fig.canvas.draw_idle()
-            #return
+        # Delete if near, else add
+        if nearest_idx is not None:
+            del self.levels[nearest_idx]
+        else:
+            self.levels.append(float(price_value))
 
-        # Otherwise add
-        self.levels.append(float(price_value))
+        self.sync_state()
         self.redraw_levels()
         self.fig.canvas.draw_idle()
 
-    # ---------- Click handlers ----------
+    # ---------- Event handlers ----------
     def on_click(self, event):
         if event.button != 1:
             return
@@ -301,25 +322,50 @@ class TickerWithRSIPlot:
         if event.xdata is None or event.ydata is None:
             return
 
+        # Find nearest candle by time
         xnum = mdates.date2num(self.df.index.to_pydatetime())
         idx = int(np.argmin(np.abs(xnum - event.xdata)))
 
         row = self.df.iloc[idx]
         rsi_here = float(row["RSI"])
 
+        # Only accept click if it's near the RSI curve value at that time
         if abs(rsi_here - float(event.ydata)) > RSI_CLICK_TOL:
             return
 
+        # Toggle a price level at the candle close
         self.toggle_level(float(row["Close"]))
 
+    def on_key(self, event):
+        if event.key == "r":
+            print("RESET")
+            self.levels.clear()
+            self.sync_state()
+            self.redraw_levels()
+            self.fig.canvas.draw_idle()
+
+
+# ===================== Main =====================
 
 def main():
-    sym = input(f"Ticker (default {DEFAULT_SYMBOL}): ").strip() or DEFAULT_SYMBOL
-    print(f"Using {sym}")
+    state = load_state()
+    print("Loaded:", state)
+
+    sym = input(f"Ticker (default {state.symbol}): ").strip() or state.symbol
+    state.symbol = sym
+
+    print("Using", sym)
     print("Flat-to-flat alternating model:")
     print("Trade 1: BUY→SELL (long), Trade 2: SELL→BUY (short), etc.")
     print("Click near an existing line to delete it.")
-    TickerWithRSIPlot(sym)
+
+    app = TickerWithRSIPlot(sym, state)
+
+    def _on_close(_evt):
+        save_state(state)
+        print("State saved:", default_state_path())
+
+    app.fig.canvas.mpl_connect("close_event", _on_close)
     plt.show()
 
 
