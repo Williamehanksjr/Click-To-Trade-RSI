@@ -17,7 +17,7 @@ import matplotlib.dates as mdates
 
 # === CONFIG ===
 DEFAULT_SYMBOL = "BTC-USD"
-PERIOD = "3d"
+PERIOD = "2d"
 INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
@@ -212,7 +212,7 @@ class TickerWithRSIPlot:
         for lvl in self.levels:
             count += 1
             color = self.color_from_trade_count(count)
-            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color)
+            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color, lw=.5)
             self.level_artists.append(line)
 
     def update_data_and_redraw(self):
@@ -231,8 +231,8 @@ class TickerWithRSIPlot:
         self.ax_price.clear()
         self.ax_rsi.clear()
 
-        self.ax_price.plot(x, p, lw=0.5, color="blue")
-        self.ax_rsi.plot(x, r, lw=0.25, color="black")
+        self.ax_price.plot(x, p, lw=0.75, color="blue")
+        self.ax_rsi.plot(x, r, lw=0.75, color="black")
 
         self.ax_price.set_facecolor("lightgray")
         self.ax_rsi.set_facecolor("cyan")
@@ -246,7 +246,7 @@ class TickerWithRSIPlot:
             fontsize=16,
             color="black"
         )
-
+        #self.ax_price.set_fontsze(23)
         self.ax_price.set_title(
             f"{self.symbol}  {last:,.3f}  "
             f"Interval:{self.interval}  "
@@ -254,7 +254,7 @@ class TickerWithRSIPlot:
             f"Unrealized:{unrealized:,.3f}  "
             f"Total:{total:,.3f}  {status}",
             color="black",
-            fontsize=15
+            fontsize=12
         )
         self.ax_price.set_ylabel("Price")
 
