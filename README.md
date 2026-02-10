@@ -79,3 +79,18 @@ Data Source
 Installation
 
 ⸻
+
+## CCXT Integration
+
+The application now supports multiple data sources:
+
+**yfinance (default)**: Stocks, ETFs, and crypto from Yahoo Finance
+**CCXT**: Real-time data from 111+ cryptocurrency exchanges
+
+To use CCXT, modify the configuration in rsi_price5.py:
+```python
+DATA_SOURCE = "ccxt"
+EXCHANGE_NAME = "coinbase"  # or "binance", "kraken", etc.
+```
+
+See [CCXT_INTEGRATION.md](CCXT_INTEGRATION.md) for detailed documentation.

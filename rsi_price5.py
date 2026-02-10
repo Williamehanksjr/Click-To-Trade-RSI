@@ -9,6 +9,14 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+# Try to import ccxt; if not available, only yfinance will work
+try:
+    import ccxt
+    CCXT_AVAILABLE = True
+except ImportError:
+    CCXT_AVAILABLE = False
+    ccxt = None
+
 
 # === CONFIG ===
 DEFAULT_SYMBOL = "BTC-USD"
@@ -17,9 +25,14 @@ INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
 
-# Data source selector: currently the script uses yfinance. "coinbase" is a planned
-# option but not yet implemented — see TODO below. Valid values: "yfinance", "coinbase"
+# Data source selector: "yfinance" or "ccxt"
+# - "yfinance": Uses yfinance library (supports symbols like "BTC-USD")
+# - "ccxt": Uses CCXT library to fetch from exchanges (supports symbols like "BTC/USD")
 DATA_SOURCE = "yfinance"
+
+# CCXT configuration (only used when DATA_SOURCE = "ccxt")
+EXCHANGE_NAME = "coinbase"  # Exchange name (e.g., "coinbase", "binance", "kraken")
+CCXT_LIMIT = 1000           # Number of candles to fetch
 
 LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
 RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
@@ -75,12 +88,107 @@ class TickerWithRSIPlot:
         timer.start()
 
     # ---------- Data ----------
+    def convert_symbol_to_ccxt(self, symbol: str) -> str:
+        """
+        Convert yfinance-style symbol to CCXT format.
+        Examples:
+            "BTC-USD" -> "BTC/USD"
+            "ETH-USD" -> "ETH/USD"
+            "BTC/USD" -> "BTC/USD" (already in CCXT format)
+        """
+        if "/" in symbol:
+            return symbol  # Already in CCXT format
+        return symbol.replace("-", "/")
+    
+    def convert_timeframe_to_ccxt(self, interval: str) -> str:
+        """
+        Convert yfinance interval to CCXT timeframe.
+        Most intervals are compatible between yfinance and CCXT (1m, 5m, 15m, 1h, 1d, etc.)
+        This method provides a conversion hook in case exchange-specific mappings are needed.
+        
+        Examples:
+            "1m" -> "1m"
+            "5m" -> "5m"
+            "15m" -> "15m"
+            "1h" -> "1h"
+            "1d" -> "1d"
+        """
+        # Direct mapping - most exchanges use the same format
+        # Could be extended with exchange-specific mappings if needed
+        return interval
+    
+    def fetch_data_ccxt(self, exchange_name: str = None):
+        """
+        Fetch OHLCV data using CCXT library.
+        
+        Args:
+            exchange_name: Name of the exchange (default: EXCHANGE_NAME from config)
+        
+        Returns:
+            DataFrame with DateTime index, Close column, and RSI column
+        """
+        if not CCXT_AVAILABLE:
+            raise ImportError(
+                "CCXT library is not installed. "
+                "Install it with: pip install ccxt"
+            )
+        
+        if exchange_name is None:
+            exchange_name = EXCHANGE_NAME
+        
+        try:
+            # Get the exchange class
+            exchange_class = getattr(ccxt, exchange_name)
+            exchange = exchange_class()
+            
+            # Convert symbol to CCXT format
+            ccxt_symbol = self.convert_symbol_to_ccxt(self.symbol)
+            
+            # Convert timeframe
+            ccxt_timeframe = self.convert_timeframe_to_ccxt(INTERVAL)
+            
+            # Fetch OHLCV data
+            ohlcv = exchange.fetch_ohlcv(
+                ccxt_symbol,
+                timeframe=ccxt_timeframe,
+                limit=CCXT_LIMIT
+            )
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv,
+                columns=["timestamp", "Open", "High", "Low", "Close", "Volume"]
+            )
+            
+            # Convert timestamp to datetime and set as index
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("timestamp", inplace=True)
+            
+            if df.empty:
+                print(f"No data for {ccxt_symbol} on {exchange_name}")
+                return df
+            
+            # Compute RSI
+            df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
+            return df.dropna()
+            
+        except AttributeError:
+            available_msg = ""
+            if CCXT_AVAILABLE and ccxt is not None:
+                available_msg = f"Available exchanges: {', '.join(ccxt.exchanges)}"
+            raise ValueError(
+                f"Exchange '{exchange_name}' is not supported by CCXT. {available_msg}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Error fetching data from {exchange_name} for {self.symbol}: {str(e)}"
+            )
+    
     def fetch_data(self):
-        # NOTE: DATA_SOURCE exists as a config toggle. Currently only "yfinance"
-        # is implemented. Implementing "coinbase" would require a new fetch
-        # path (Coinbase Pro/Exchange REST API or CCXT) to return a DataFrame
-        # with a DateTime index and a Close column. If you want, I can add
-        # Coinbase support in a follow-up commit.
+        """
+        Fetch data based on DATA_SOURCE configuration.
+        Routes to either yfinance or CCXT implementation.
+        """
         if DATA_SOURCE == "yfinance":
             df = yf.download(
                 self.symbol,
@@ -94,9 +202,15 @@ class TickerWithRSIPlot:
 
             df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
             return df.dropna()
-
-        # Placeholder for future Coinbase implementation
-        raise NotImplementedError(f"DATA_SOURCE='{DATA_SOURCE}' is not implemented")
+        
+        elif DATA_SOURCE == "ccxt":
+            return self.fetch_data_ccxt()
+        
+        else:
+            raise ValueError(
+                f"Invalid DATA_SOURCE: '{DATA_SOURCE}'. "
+                f"Valid options: 'yfinance', 'ccxt'"
+            )
 
     def get_last_price(self):
         if self.price_line is None:
