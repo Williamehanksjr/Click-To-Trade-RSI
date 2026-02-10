@@ -17,6 +17,10 @@ INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
 
+# Data source selector: currently the script uses yfinance. "coinbase" is a planned
+# option but not yet implemented — see TODO below. Valid values: "yfinance", "coinbase"
+DATA_SOURCE = "yfinance"
+
 LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
 RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
 
@@ -72,19 +76,27 @@ class TickerWithRSIPlot:
 
     # ---------- Data ----------
     def fetch_data(self):
-        df = yf.download(
-            self.symbol,
-            period=PERIOD,
-            interval=INTERVAL,
-            progress=False,
-        )
-        #print(df)
-        if df.empty:
-            print(f"No data for {self.symbol}")
-            return df
+        # NOTE: DATA_SOURCE exists as a config toggle. Currently only "yfinance"
+        # is implemented. Implementing "coinbase" would require a new fetch
+        # path (Coinbase Pro/Exchange REST API or CCXT) to return a DataFrame
+        # with a DateTime index and a Close column. If you want, I can add
+        # Coinbase support in a follow-up commit.
+        if DATA_SOURCE == "yfinance":
+            df = yf.download(
+                self.symbol,
+                period=PERIOD,
+                interval=INTERVAL,
+                progress=False,
+            )
+            if df.empty:
+                print(f"No data for {self.symbol}")
+                return df
 
-        df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
-        return df.dropna()
+            df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
+            return df.dropna()
+
+        # Placeholder for future Coinbase implementation
+        raise NotImplementedError(f"DATA_SOURCE='{DATA_SOURCE}' is not implemented")
 
     def get_last_price(self):
         if self.price_line is None:
@@ -133,7 +145,7 @@ class TickerWithRSIPlot:
         status = "Risk Off"
 
         n = len(self.levels)
-    
+        
         pairs = n // 2
 
         # Realized for each completed trade
