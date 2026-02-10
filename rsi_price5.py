@@ -103,6 +103,9 @@ class TickerWithRSIPlot:
     def convert_timeframe_to_ccxt(self, interval: str) -> str:
         """
         Convert yfinance interval to CCXT timeframe.
+        Most intervals are compatible between yfinance and CCXT (1m, 5m, 15m, 1h, 1d, etc.)
+        This method provides a conversion hook in case exchange-specific mappings are needed.
+        
         Examples:
             "1m" -> "1m"
             "5m" -> "5m"
@@ -110,7 +113,8 @@ class TickerWithRSIPlot:
             "1h" -> "1h"
             "1d" -> "1d"
         """
-        # Most intervals are compatible, but we can add mapping if needed
+        # Direct mapping - most exchanges use the same format
+        # Could be extended with exchange-specific mappings if needed
         return interval
     
     def fetch_data_ccxt(self, exchange_name: str = None):
@@ -169,9 +173,11 @@ class TickerWithRSIPlot:
             return df.dropna()
             
         except AttributeError:
+            available_msg = ""
+            if CCXT_AVAILABLE and ccxt is not None:
+                available_msg = f"Available exchanges: {', '.join(ccxt.exchanges)}"
             raise ValueError(
-                f"Exchange '{exchange_name}' is not supported by CCXT. "
-                f"Available exchanges: {', '.join(ccxt.exchanges)}"
+                f"Exchange '{exchange_name}' is not supported by CCXT. {available_msg}"
             )
         except Exception as e:
             raise RuntimeError(
