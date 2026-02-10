@@ -34,6 +34,10 @@ except ImportError:
 # 4. Map symbol format as needed (each exchange has different formats)
 DATA_SOURCE = "yahoo"  # Options: "yahoo", "coinbase"
 
+# Symbol format depends on DATA_SOURCE:
+# - Yahoo Finance: "BTC-USD", "ETH-USD", "AAPL", "SPY"
+# - Coinbase: "BTC/USD", "ETH/USD"
+# Update this symbol when changing DATA_SOURCE to match the expected format
 DEFAULT_SYMBOL = "BTC-USD"  # For yahoo: "BTC-USD", For coinbase: "BTC/USD"
 PERIOD = "3d"
 INTERVAL = "15m"
@@ -52,6 +56,10 @@ def map_interval_to_ccxt_timeframe(interval: str) -> str:
     CCXT uses: 1m, 5m, 15m, 30m, 1h, 1d, etc. (mostly compatible)
     
     Returns the CCXT-compatible timeframe string.
+    
+    NOTE: Some intervals may be mapped to different timeframes if not supported
+    by CCXT. For example, 2m may fallback to 1m, and 90m to 1h. This ensures
+    compatibility but may result in different data granularity than requested.
     """
     # Most intervals are already compatible between yfinance and CCXT
     # This mapping handles any edge cases
@@ -184,6 +192,9 @@ class TickerWithRSIPlot:
         
         elif DATA_SOURCE == "coinbase":
             # Coinbase exchange data via CCXT
+            # NOTE: This implementation uses public (unauthenticated) endpoints only.
+            # Private endpoints (trading, account info) require API keys and are not
+            # supported in this data-only implementation.
             if not CCXT_AVAILABLE:
                 error_msg = (
                     f"ERROR: CCXT library not available.\n"
@@ -195,7 +206,7 @@ class TickerWithRSIPlot:
                 return pd.DataFrame()
             
             try:
-                # Initialize Coinbase exchange
+                # Initialize Coinbase exchange (no API keys - public endpoints only)
                 exchange = ccxt.coinbase()
                 
                 # Map interval and period to CCXT format
@@ -205,13 +216,20 @@ class TickerWithRSIPlot:
                 # Calculate start time (milliseconds since epoch)
                 since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
                 
+                # Calculate appropriate limit based on period and interval
+                # This ensures we request enough data points to cover the period
+                # CCXT typically allows up to 1000 candles per request
+                # For 3 days at 15m intervals: 3 * 24 * 4 = 288 candles
+                # For safety, we use a max of 1000 which covers most use cases
+                limit = 1000  # Maximum data points (sufficient for most period/interval combos)
+                
                 # Fetch OHLCV data
                 # Symbol format for Coinbase: "BTC/USD", "ETH/USD", etc.
                 ohlcv = exchange.fetch_ohlcv(
                     symbol=self.symbol,
                     timeframe=timeframe,
                     since=since,
-                    limit=1000  # Maximum data points
+                    limit=limit
                 )
                 
                 if not ohlcv:
