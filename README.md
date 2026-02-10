@@ -78,4 +78,32 @@ Data Source
 
 Installation
 
+**Dependencies**
+
+The app requires Python 3.7+ and the following packages:
+- numpy
+- pandas  
+- matplotlib
+- yfinance (for Yahoo Finance data - installed by default)
+
+**Optional: Coinbase Support**
+
+To use Coinbase as a data source, install CCXT:
+```bash
+pip install ccxt
+```
+
+**Selecting a Data Source**
+
+Edit the `DATA_SOURCE` constant at the top of `rsi_price5.py`:
+```python
+DATA_SOURCE = "yahoo"     # Default: Yahoo Finance (BTC-USD, AAPL, etc.)
+# or
+DATA_SOURCE = "coinbase"  # Coinbase Exchange (BTC/USD, ETH/USD, etc.)
+```
+
+**Important:** When using Coinbase, use the appropriate symbol format:
+- Yahoo Finance: `BTC-USD`, `ETH-USD`
+- Coinbase: `BTC/USD`, `ETH/USD`
+
 ⸻

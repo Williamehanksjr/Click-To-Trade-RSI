@@ -8,21 +8,103 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+
+# Conditional CCXT import - only required if using Coinbase data source
+try:
+    import ccxt
+    CCXT_AVAILABLE = True
+except ImportError:
+    CCXT_AVAILABLE = False
+    ccxt = None
 
 
 # === CONFIG ===
-DEFAULT_SYMBOL = "BTC-USD"
+# Data source selector: Choose between Yahoo Finance and Coinbase
+# Valid values: "yahoo" (default), "coinbase"
+# 
+# - "yahoo": Uses yfinance library (no additional dependencies)
+# - "coinbase": Uses CCXT library to fetch data from Coinbase exchange
+#               Requires: pip install ccxt
+#
+# To extend with other exchanges:
+# 1. Add a new DATA_SOURCE option (e.g., "binance", "kraken")
+# 2. Add corresponding logic in fetch_data() method
+# 3. Use CCXT exchange-specific implementation (e.g., ccxt.binance())
+# 4. Map symbol format as needed (each exchange has different formats)
+DATA_SOURCE = "yahoo"  # Options: "yahoo", "coinbase"
+
+# Symbol format depends on DATA_SOURCE:
+# - Yahoo Finance: "BTC-USD", "ETH-USD", "AAPL", "SPY"
+# - Coinbase: "BTC/USD", "ETH/USD"
+# Update this symbol when changing DATA_SOURCE to match the expected format
+DEFAULT_SYMBOL = "BTC-USD"  # For yahoo: "BTC-USD", For coinbase: "BTC/USD"
 PERIOD = "3d"
 INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
 
-# Data source selector: currently the script uses yfinance. "coinbase" is a planned
-# option but not yet implemented — see TODO below. Valid values: "yfinance", "coinbase"
-DATA_SOURCE = "yfinance"
-
 LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
 RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
+
+
+def map_interval_to_ccxt_timeframe(interval: str) -> str:
+    """
+    Maps yfinance interval format to CCXT timeframe format.
+    
+    yfinance uses: 1m, 5m, 15m, 30m, 1h, 1d, etc.
+    CCXT uses: 1m, 5m, 15m, 30m, 1h, 1d, etc. (mostly compatible)
+    
+    Returns the CCXT-compatible timeframe string.
+    
+    NOTE: Some intervals may be mapped to different timeframes if not supported
+    by CCXT. For example, 2m may fallback to 1m, and 90m to 1h. This ensures
+    compatibility but may result in different data granularity than requested.
+    """
+    # Most intervals are already compatible between yfinance and CCXT
+    # This mapping handles any edge cases
+    interval_map = {
+        "1m": "1m",
+        "2m": "1m",  # Fallback to 1m if 2m not available
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "60m": "1h",
+        "90m": "1h",  # Fallback to 1h
+        "1h": "1h",
+        "1d": "1d",
+        "5d": "1d",  # Fallback to 1d
+        "1wk": "1w",
+        "1mo": "1M",
+    }
+    return interval_map.get(interval, interval)
+
+
+def parse_period_to_days(period: str) -> int:
+    """
+    Converts yfinance period format to number of days.
+    
+    Examples: "1d" -> 1, "3d" -> 3, "1mo" -> 30, "1y" -> 365
+    """
+    period_map = {
+        "1d": 1,
+        "5d": 5,
+        "1mo": 30,
+        "3mo": 90,
+        "6mo": 180,
+        "1y": 365,
+        "2y": 730,
+        "5y": 1825,
+        "10y": 3650,
+        "ytd": 365,  # Approximate
+        "max": 3650,  # Limit to ~10 years
+    }
+    
+    # Handle custom formats like "3d", "7d", etc.
+    if period.endswith("d") and period[:-1].isdigit():
+        return int(period[:-1])
+    
+    return period_map.get(period, 3)  # Default to 3 days
 
 
 def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -76,12 +158,25 @@ class TickerWithRSIPlot:
 
     # ---------- Data ----------
     def fetch_data(self):
-        # NOTE: DATA_SOURCE exists as a config toggle. Currently only "yfinance"
-        # is implemented. Implementing "coinbase" would require a new fetch
-        # path (Coinbase Pro/Exchange REST API or CCXT) to return a DataFrame
-        # with a DateTime index and a Close column. If you want, I can add
-        # Coinbase support in a follow-up commit.
-        if DATA_SOURCE == "yfinance":
+        """
+        Fetches historical price data based on DATA_SOURCE configuration.
+        
+        Supported data sources:
+        - "yahoo": Uses yfinance library (default)
+        - "coinbase": Uses CCXT library to fetch from Coinbase exchange
+        
+        Returns a pandas DataFrame with DateTime index and columns:
+        - Close: Closing price
+        - RSI: Computed RSI values
+        
+        To add support for other exchanges (e.g., Binance, Kraken):
+        1. Add elif block for new DATA_SOURCE value
+        2. Initialize CCXT exchange: exchange = ccxt.binance()
+        3. Fetch OHLCV data using exchange.fetch_ohlcv()
+        4. Convert to DataFrame format as shown in coinbase example
+        """
+        if DATA_SOURCE == "yahoo":
+            # Yahoo Finance data source (default)
             df = yf.download(
                 self.symbol,
                 period=PERIOD,
@@ -94,9 +189,87 @@ class TickerWithRSIPlot:
 
             df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
             return df.dropna()
-
-        # Placeholder for future Coinbase implementation
-        raise NotImplementedError(f"DATA_SOURCE='{DATA_SOURCE}' is not implemented")
+        
+        elif DATA_SOURCE == "coinbase":
+            # Coinbase exchange data via CCXT
+            # NOTE: This implementation uses public (unauthenticated) endpoints only.
+            # Private endpoints (trading, account info) require API keys and are not
+            # supported in this data-only implementation.
+            if not CCXT_AVAILABLE:
+                error_msg = (
+                    f"ERROR: CCXT library not available.\n"
+                    f"To use Coinbase data source, install CCXT:\n"
+                    f"  pip install ccxt\n"
+                    f"Then restart the application."
+                )
+                print(error_msg)
+                return pd.DataFrame()
+            
+            try:
+                # Initialize Coinbase exchange (no API keys - public endpoints only)
+                exchange = ccxt.coinbase()
+                
+                # Map interval and period to CCXT format
+                timeframe = map_interval_to_ccxt_timeframe(INTERVAL)
+                days = parse_period_to_days(PERIOD)
+                
+                # Calculate start time (milliseconds since epoch)
+                since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+                
+                # Calculate appropriate limit based on period and interval
+                # This ensures we request enough data points to cover the period
+                # CCXT typically allows up to 1000 candles per request
+                # For 3 days at 15m intervals: 3 * 24 * 4 = 288 candles
+                # For safety, we use a max of 1000 which covers most use cases
+                limit = 1000  # Maximum data points (sufficient for most period/interval combos)
+                
+                # Fetch OHLCV data
+                # Symbol format for Coinbase: "BTC/USD", "ETH/USD", etc.
+                ohlcv = exchange.fetch_ohlcv(
+                    symbol=self.symbol,
+                    timeframe=timeframe,
+                    since=since,
+                    limit=limit
+                )
+                
+                if not ohlcv:
+                    print(f"No data received from Coinbase for {self.symbol}")
+                    return pd.DataFrame()
+                
+                # Convert to DataFrame
+                # OHLCV format: [timestamp, open, high, low, close, volume]
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "Open", "High", "Low", "Close", "Volume"]
+                )
+                
+                # Convert timestamp to datetime index
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df.set_index("timestamp", inplace=True)
+                
+                # Compute RSI
+                df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
+                
+                return df.dropna()
+                
+            except ccxt.NetworkError as e:
+                print(f"Network error fetching Coinbase data: {e}")
+                return pd.DataFrame()
+            except ccxt.ExchangeError as e:
+                print(f"Coinbase exchange error: {e}")
+                print(f"Note: Check if symbol '{self.symbol}' is valid for Coinbase.")
+                print(f"Coinbase symbols use format: BTC/USD, ETH/USD, etc.")
+                return pd.DataFrame()
+            except Exception as e:
+                print(f"Unexpected error fetching Coinbase data: {e}")
+                return pd.DataFrame()
+        
+        else:
+            # Unknown data source
+            raise NotImplementedError(
+                f"DATA_SOURCE='{DATA_SOURCE}' is not implemented.\n"
+                f"Valid options: 'yahoo', 'coinbase'"
+            )
 
     def get_last_price(self):
         if self.price_line is None:
