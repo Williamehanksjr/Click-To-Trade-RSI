@@ -13,6 +13,9 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from agents.base import TradingAgent
+from agents.models import MarketSnapshot, PositionState
+from agents.registry import available_agents, create_agent
 
 
 # === CONFIG ===
@@ -114,9 +117,11 @@ class TickerWithRSIPlot:
       - 'r' resets all levels (and persists)
     """
 
-    def __init__(self, symbol: str, state: AppState, interval: str):
+    def __init__(self, symbol: str, state: AppState, interval: str, agent: TradingAgent):
         self.symbol = symbol
         self.state = state
+        self.agent = agent
+        self.agent_signal_text = "HOLD"
 
         # SESSION-ONLY interval (NOT persisted)
         self.interval = interval
@@ -195,6 +200,28 @@ class TickerWithRSIPlot:
         total = realized + unrealized
         return realized, unrealized, total, status
 
+    def current_position_state(self) -> PositionState:
+        if len(self.levels) % 2 == 0:
+            return PositionState.RISK_OFF
+
+        trade_index = len(self.levels) // 2
+        return PositionState.LONG if (trade_index % 2 == 0) else PositionState.SHORT
+
+    def update_agent_signal(self, last_price: float, last_rsi: float, timestamp: str) -> str:
+        # Agent scaffold is advisory-only for now; user clicks still execute trades.
+        snapshot = MarketSnapshot(
+            symbol=self.symbol,
+            timestamp=timestamp,
+            close=last_price,
+            rsi=last_rsi,
+        )
+        decision = self.agent.on_snapshot(snapshot, self.current_position_state())
+        if decision.reason:
+            self.agent_signal_text = f"{decision.action.value} ({decision.reason})"
+        else:
+            self.agent_signal_text = decision.action.value
+        return self.agent_signal_text
+
     # ---------- Drawing ----------
     def color_from_trade_count(self, count: int) -> str:
         cycle = ["black", "green", "black", "red"]
@@ -227,6 +254,7 @@ class TickerWithRSIPlot:
 
         last = float(p.iloc[-1])
         realized, unrealized, total, status = self.simulate(last)
+        signal = self.update_agent_signal(last, float(r.iloc[-1]), str(x[-1]))
 
         self.ax_price.clear()
         self.ax_rsi.clear()
@@ -252,7 +280,8 @@ class TickerWithRSIPlot:
             f"Interval:{self.interval}  "
             f"Realized:{realized:,.3f}  "
             f"Unrealized:{unrealized:,.3f}  "
-            f"Total:{total:,.3f}  {status}",
+            f"Total:{total:,.3f}  {status}  "
+            f"Agent:{self.agent.display_name} {signal}",
             color="black",
             fontsize=12
         )
@@ -357,8 +386,21 @@ def main():
     print("Trade 1: BUY→SELL (long), Trade 2: SELL→BUY (short), etc.")
     print("Click near an existing line to delete it.")
     print("Tip: click inside the chart window once so keypresses work, then press 'r' to reset.")
+    print("Available agents:")
+    for key, label in sorted(available_agents().items()):
+        print(f"  - {key}: {label}")
 
-    app = TickerWithRSIPlot(sym, state, interval)
+    agent_key = input("Agent (default manual): ").strip().lower() or "manual"
+    try:
+        agent = create_agent(agent_key)
+    except ValueError as exc:
+        print(exc)
+        print("Falling back to manual.")
+        agent = create_agent("manual")
+
+    print("Using agent:", agent.display_name)
+
+    app = TickerWithRSIPlot(sym, state, interval, agent)
 
     def _on_close(_evt):
         # interval override is session-only, and we never modified state.interval, so save is safe
