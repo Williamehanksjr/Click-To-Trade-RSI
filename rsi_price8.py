@@ -17,7 +17,7 @@ import matplotlib.dates as mdates
 
 # === CONFIG ===
 DEFAULT_SYMBOL = "BTC-USD"
-PERIOD = "3d"
+PERIOD = "2d"
 INTERVAL = "15m"
 REFRESH_MS = 5_000
 RSI_LENGTH = 14
@@ -43,7 +43,7 @@ def default_state_path() -> Path:
 class AppState:
     symbol: str = DEFAULT_SYMBOL
     period: str = PERIOD
-    interval: str = INTERVAL
+    interval: str = INTERVAL  # persisted field, but we'll NOT change it for the session override
     price_lines: list[float] = field(default_factory=list)
 
 
@@ -51,12 +51,6 @@ def load_state() -> AppState:
     path = default_state_path()
     if not path.exists():
         return AppState()
-# Data source selector: currently the script uses yfinance. "coinbase" is a planned
-# option but not yet implemented — see TODO below. Valid values: "yfinance", "coinbase"
-DATA_SOURCE = "yfinance"
-
-LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
-RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -70,6 +64,7 @@ RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
 
     if not isinstance(st.price_lines, list):
         st.price_lines = []
+
     return st
 
 
@@ -92,8 +87,8 @@ def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -108,20 +103,23 @@ class TickerWithRSIPlot:
       Trade 3: BUY→SELL (long)
       ...
 
-    Click on price chart:
+    Click price chart:
       - Adds a horizontal level
       - If click is near an existing level (within tolerance), deletes it
 
-    Click on RSI chart (near the RSI curve):
-      - Adds/deletes a level at that candle's Close (same toggle behavior)
+    Click RSI chart (near the RSI curve):
+      - Toggles a level at that candle's Close
 
     Key:
-      - 'r' resets all levels (and state)
+      - 'r' resets all levels (and persists)
     """
 
-    def __init__(self, symbol: str, state: AppState):
+    def __init__(self, symbol: str, state: AppState, interval: str):
         self.symbol = symbol
         self.state = state
+
+        # SESSION-ONLY interval (NOT persisted)
+        self.interval = interval
 
         self.fig, (self.ax_price, self.ax_rsi) = plt.subplots(
             2, 1, sharex=True,
@@ -138,7 +136,7 @@ class TickerWithRSIPlot:
 
         # Event hooks
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
-        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key)  # press 'r'
 
         # Initial draw + timer refresh
         self.update_data_and_redraw()
@@ -151,37 +149,15 @@ class TickerWithRSIPlot:
         df = yf.download(
             self.symbol,
             period=self.state.period,
-            interval=self.state.interval,
+            interval=self.interval,   # <-- session-only interval
             progress=False,
-            auto_adjust=False,  # avoids yfinance warning + keeps consistent Close
+            auto_adjust=False,
         )
         if df is None or df.empty:
             return pd.DataFrame()
 
         df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
         return df.dropna()
-    def fetch_data(self):
-        # NOTE: DATA_SOURCE exists as a config toggle. Currently only "yfinance"
-        # is implemented. Implementing "coinbase" would require a new fetch
-        # path (Coinbase Pro/Exchange REST API or CCXT) to return a DataFrame
-        # with a DateTime index and a Close column. If you want, I can add
-        # Coinbase support in a follow-up commit.
-        if DATA_SOURCE == "yfinance":
-            df = yf.download(
-                self.symbol,
-                period=PERIOD,
-                interval=INTERVAL,
-                progress=False,
-            )
-            if df.empty:
-                print(f"No data for {self.symbol}")
-                return df
-
-            df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
-            return df.dropna()
-
-        # Placeholder for future Coinbase implementation
-        raise NotImplementedError(f"DATA_SOURCE='{DATA_SOURCE}' is not implemented")
 
     def last_price(self) -> float | None:
         if self.df is None or self.df.empty:
@@ -195,18 +171,14 @@ class TickerWithRSIPlot:
         status = "Risk Off"
 
         n = len(self.levels)
-        
         pairs = n // 2
 
         # Completed trades
         for t in range(pairs):
-            entry = self.levels[2*t]
-            exit_ = self.levels[2*t + 1]
-            entry_side = "BUY" if (t % 2 == 0) else "SELL"  # Trade 1 long, Trade 2 short, ...
-            if entry_side == "BUY":
-                realized += (exit_ - entry)
-            else:
-                realized += (entry - exit_)
+            entry = self.levels[2 * t]
+            exit_ = self.levels[2 * t + 1]
+            entry_side = "BUY" if (t % 2 == 0) else "SELL"
+            realized += (exit_ - entry) if entry_side == "BUY" else (entry - exit_)
 
         # Open trade (odd number of levels)
         if n % 2 == 1:
@@ -225,12 +197,10 @@ class TickerWithRSIPlot:
 
     # ---------- Drawing ----------
     def color_from_trade_count(self, count: int) -> str:
-        # Keeps your vibe: black baseline + green/red for alternating legs
         cycle = ["black", "green", "black", "red"]
         return cycle[count % 4]
 
     def redraw_levels(self):
-        # Remove old artists
         for a in self.level_artists:
             try:
                 a.remove()
@@ -242,7 +212,7 @@ class TickerWithRSIPlot:
         for lvl in self.levels:
             count += 1
             color = self.color_from_trade_count(count)
-            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color)
+            line = self.ax_price.axhline(lvl, ls="--", alpha=0.85, color=color, lw=.5)
             self.level_artists.append(line)
 
     def update_data_and_redraw(self):
@@ -258,15 +228,12 @@ class TickerWithRSIPlot:
         last = float(p.iloc[-1])
         realized, unrealized, total, status = self.simulate(last)
 
-        # Clear axes each refresh (simple + avoids stacking artifacts)
         self.ax_price.clear()
         self.ax_rsi.clear()
 
-        # Plot
-        self.ax_price.plot(x, p, lw=0.5, color="blue")
-        self.ax_rsi.plot(x, r, lw=0.25, color="black")
+        self.ax_price.plot(x, p, lw=0.75, color="blue")
+        self.ax_rsi.plot(x, r, lw=0.75, color="black")
 
-        # Styling
         self.ax_price.set_facecolor("lightgray")
         self.ax_rsi.set_facecolor("cyan")
 
@@ -279,15 +246,15 @@ class TickerWithRSIPlot:
             fontsize=16,
             color="black"
         )
-
+        #self.ax_price.set_fontsze(23)
         self.ax_price.set_title(
             f"{self.symbol}  {last:,.3f}  "
-            f"Interval:{self.state.interval}  "
+            f"Interval:{self.interval}  "
             f"Realized:{realized:,.3f}  "
             f"Unrealized:{unrealized:,.3f}  "
             f"Total:{total:,.3f}  {status}",
             color="black",
-            fontsize=15
+            fontsize=12
         )
         self.ax_price.set_ylabel("Price")
 
@@ -299,14 +266,14 @@ class TickerWithRSIPlot:
         self.ax_rsi.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         self.fig.autofmt_xdate()
 
-        # Levels
         self.redraw_levels()
         self.fig.canvas.draw_idle()
 
-    # ---------- Level toggle / persistence ----------
+    # ---------- Persistence helpers ----------
     def sync_state(self):
         self.state.price_lines = list(self.levels)
 
+    # ---------- Toggle line ----------
     def toggle_level(self, price_value: float):
         last = self.last_price()
         if last is None:
@@ -314,7 +281,6 @@ class TickerWithRSIPlot:
 
         tol = last * LINE_TOLERANCE_PCT
 
-        # Find nearest existing level within tolerance
         nearest_idx = None
         nearest_delta = None
         for i, lvl in enumerate(self.levels):
@@ -323,7 +289,6 @@ class TickerWithRSIPlot:
                 nearest_delta = d
                 nearest_idx = i
 
-        # Delete if near, else add
         if nearest_idx is not None:
             del self.levels[nearest_idx]
         else:
@@ -333,7 +298,7 @@ class TickerWithRSIPlot:
         self.redraw_levels()
         self.fig.canvas.draw_idle()
 
-    # ---------- Event handlers ----------
+    # ---------- Events ----------
     def on_click(self, event):
         if event.button != 1:
             return
@@ -351,25 +316,24 @@ class TickerWithRSIPlot:
         if event.xdata is None or event.ydata is None:
             return
 
-        # Find nearest candle by time
         xnum = mdates.date2num(self.df.index.to_pydatetime())
         idx = int(np.argmin(np.abs(xnum - event.xdata)))
 
         row = self.df.iloc[idx]
         rsi_here = float(row["RSI"])
 
-        # Only accept click if it's near the RSI curve value at that time
         if abs(rsi_here - float(event.ydata)) > RSI_CLICK_TOL:
             return
 
-        # Toggle a price level at the candle close
         self.toggle_level(float(row["Close"]))
 
     def on_key(self, event):
+        # Keypresses require figure focus: click once inside the chart, then press 'r'
         if event.key == "r":
-            print("RESET")
+            print("RESET (r)")
             self.levels.clear()
             self.sync_state()
+            save_state(self.state)  # persist reset immediately
             self.redraw_levels()
             self.fig.canvas.draw_idle()
 
@@ -383,14 +347,21 @@ def main():
     sym = input(f"Ticker (default {state.symbol}): ").strip() or state.symbol
     state.symbol = sym
 
+    # interval override at startup (NOT persisted)
+    interval_default = state.interval or INTERVAL
+    interval = input(f"Interval (default {interval_default}): ").strip() or interval_default
+
     print("Using", sym)
+    print("Session interval:", interval, "(not persisted)")
     print("Flat-to-flat alternating model:")
     print("Trade 1: BUY→SELL (long), Trade 2: SELL→BUY (short), etc.")
     print("Click near an existing line to delete it.")
+    print("Tip: click inside the chart window once so keypresses work, then press 'r' to reset.")
 
-    app = TickerWithRSIPlot(sym, state)
+    app = TickerWithRSIPlot(sym, state, interval)
 
     def _on_close(_evt):
+        # interval override is session-only, and we never modified state.interval, so save is safe
         save_state(state)
         print("State saved:", default_state_path())
 
