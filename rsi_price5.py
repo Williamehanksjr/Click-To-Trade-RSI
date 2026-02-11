@@ -51,6 +51,12 @@ def load_state() -> AppState:
     path = default_state_path()
     if not path.exists():
         return AppState()
+# Data source selector: currently the script uses yfinance. "coinbase" is a planned
+# option but not yet implemented — see TODO below. Valid values: "yfinance", "coinbase"
+DATA_SOURCE = "yfinance"
+
+LINE_TOLERANCE_PCT = 0.0001   # 0.015% of current price
+RSI_CLICK_TOL = 5.0           # +/- 5 RSI points
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -154,6 +160,28 @@ class TickerWithRSIPlot:
 
         df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
         return df.dropna()
+    def fetch_data(self):
+        # NOTE: DATA_SOURCE exists as a config toggle. Currently only "yfinance"
+        # is implemented. Implementing "coinbase" would require a new fetch
+        # path (Coinbase Pro/Exchange REST API or CCXT) to return a DataFrame
+        # with a DateTime index and a Close column. If you want, I can add
+        # Coinbase support in a follow-up commit.
+        if DATA_SOURCE == "yfinance":
+            df = yf.download(
+                self.symbol,
+                period=PERIOD,
+                interval=INTERVAL,
+                progress=False,
+            )
+            if df.empty:
+                print(f"No data for {self.symbol}")
+                return df
+
+            df["RSI"] = compute_rsi(df["Close"], RSI_LENGTH)
+            return df.dropna()
+
+        # Placeholder for future Coinbase implementation
+        raise NotImplementedError(f"DATA_SOURCE='{DATA_SOURCE}' is not implemented")
 
     def last_price(self) -> float | None:
         if self.df is None or self.df.empty:
@@ -167,6 +195,7 @@ class TickerWithRSIPlot:
         status = "Risk Off"
 
         n = len(self.levels)
+        
         pairs = n // 2
 
         # Completed trades
