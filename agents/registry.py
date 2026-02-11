@@ -5,12 +5,14 @@ from collections.abc import Callable
 from .base import TradingAgent
 from .manual_agent import ManualAgent
 from .rsi_threshold_agent import RsiThresholdAgent
+from .template_agent import TemplateAgent
 
 AgentFactory = Callable[[], TradingAgent]
 
 _AGENT_FACTORIES: dict[str, AgentFactory] = {
     ManualAgent.key: ManualAgent,
     RsiThresholdAgent.key: RsiThresholdAgent,
+    TemplateAgent.key: TemplateAgent,
 }
 
 
